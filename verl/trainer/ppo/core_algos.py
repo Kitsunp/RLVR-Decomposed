@@ -278,7 +278,89 @@ def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Ten
         advantages = advantages * eos_mask
 
     return advantages, returns
-
+    
+def compute_entropy_filtered_policy_loss(old_log_prob, log_prob, advantages, entropy, 
+                                       eos_mask, cliprange, token_level_scores=None,
+                                       entropy_threshold_percentile=0.8, 
+                                       positive_learning_weight=None):
+    """
+    Computa policy loss con filtrado por entropía (top 20% tokens) + NSR/W-REINFORCE
+    
+    Args:
+        old_log_prob: (bs, response_length) - log probs del modelo anterior
+        log_prob: (bs, response_length) - log probs actuales  
+        advantages: (bs, response_length) - advantages computados (NSR/PSR/W-REINFORCE)
+        entropy: (bs, response_length) - entropía por token
+        eos_mask: (bs, response_length) - máscara de tokens válidos
+        cliprange: float - clip ratio para PPO
+        entropy_threshold_percentile: float - percentil para filtrar (0.8 = top 20%)
+        
+    Returns:
+        pg_loss: scalar - policy loss filtrado por entropía
+        pg_clipfrac: scalar - fracción de gradientes clipeados
+        ppo_kl: scalar - KL divergence
+        entropy_stats: dict - estadísticas de filtrado
+    """
+    
+    # 1. Calcular threshold de entropía dinámicamente por batch
+    valid_entropy = entropy[eos_mask.bool()]
+    if len(valid_entropy) == 0:
+        return torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0), {}
+    
+    threshold = torch.quantile(valid_entropy, entropy_threshold_percentile)
+    
+    # 2. Crear máscara de tokens de alta entropía (forking tokens)
+    high_entropy_mask = (entropy >= threshold) & eos_mask
+    total_tokens = eos_mask.sum().item()
+    high_entropy_tokens = high_entropy_mask.sum().item()
+    
+    # 3. Aplicar W-REINFORCE con pesos si está configurado
+    if positive_learning_weight is not None and token_level_scores is not None:
+        correct_idx = token_level_scores.sum(-1) == 1 
+        incorrect_idx = token_level_scores.sum(-1) == 0
+        
+        # Aplicar pesos de W-REINFORCE
+        weighted_advantages = advantages.clone()
+        weighted_advantages[correct_idx] *= positive_learning_weight
+        # NSR mantiene peso 1.0 para muestras incorrectas
+    else:
+        weighted_advantages = advantages
+    
+    # 4. Computar policy loss estándar
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+    
+    pg_losses = -weighted_advantages * ratio
+    pg_losses2 = -weighted_advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    
+    pg_losses_final = torch.max(pg_losses, pg_losses2)
+    
+    # 5. ¡CLAVE! Filtrar gradientes: solo backprop en tokens de alta entropía
+    pg_losses_filtered = pg_losses_final * high_entropy_mask.float()
+    
+    # 6. Calcular métricas
+    if high_entropy_tokens > 0:
+        pg_loss = verl_F.masked_mean(pg_losses_filtered, high_entropy_mask)
+        
+        # Clipfrac solo en tokens de alta entropía
+        pg_clipfrac = ((ratio > (1.0 + cliprange)) | (ratio < (1.0 - cliprange))) & high_entropy_mask
+        pg_clipfrac = pg_clipfrac.float().sum() / high_entropy_tokens
+    else:
+        pg_loss = torch.tensor(0.0, device=old_log_prob.device)
+        pg_clipfrac = torch.tensor(0.0, device=old_log_prob.device)
+    
+    # 7. Estadísticas para logging
+    entropy_stats = {
+        'entropy_threshold': threshold.item(),
+        'high_entropy_ratio': high_entropy_tokens / max(total_tokens, 1),
+        'avg_entropy_all': valid_entropy.mean().item(),
+        'avg_entropy_filtered': entropy[high_entropy_mask].mean().item() if high_entropy_tokens > 0 else 0.0,
+        'tokens_total': total_tokens,
+        'tokens_high_entropy': high_entropy_tokens
+    }
+    
+    return pg_loss, pg_clipfrac, ppo_kl, entropy_stats
 
 def compute_remax_outcome_advantage(token_level_rewards: torch.Tensor, reward_baselines: torch.Tensor,
                                     eos_mask: torch.Tensor):
