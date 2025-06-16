@@ -288,13 +288,35 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                                  log_prob=log_prob,
-                                                                                  advantages=advantages,
-                                                                                  eos_mask=response_mask,
-                                                                                  cliprange=clip_ratio,
-                                                                                  token_level_scores=token_level_scores,
-                                                                                  positive_learning_weight=positive_learning_weight)
+                    # ¡NUEVA INTEGRACIÓN! Entropy filtering + NSR/W-REINFORCE
+                    if getattr(self.config, 'use_entropy_filtering', False):
+                        # Usar nuestro nuevo loss con filtrado por entropía
+                        pg_loss, pg_clipfrac, ppo_kl, entropy_stats = core_algos.compute_entropy_filtered_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            entropy=entropy,  # ¡Ya disponible desde forward pass!
+                            eos_mask=response_mask,
+                            cliprange=clip_ratio,
+                            token_level_scores=token_level_scores,
+                            entropy_threshold_percentile=getattr(self.config, 'entropy_threshold_percentile', 0.8),
+                            positive_learning_weight=positive_learning_weight
+                        )
+                        
+                        # Agregar métricas de entropía al logging
+                        entropy_metrics = {f'actor/{k}': v for k, v in entropy_stats.items()}
+                        append_to_dict(metrics, entropy_metrics)
+                        
+                    else:
+                        # Código original (sin filtrado por entropía)
+                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+                                                                                      log_prob=log_prob,
+                                                                                      advantages=advantages,
+                                                                                      eos_mask=response_mask,
+                                                                                      cliprange=clip_ratio,
+                                                                                      token_level_scores=token_level_scores,
+                                                                                      positive_learning_weight=positive_learning_weight)
+                    
                     # compute entropy loss from entropy
                     entropy_loss = verl_F.masked_mean(entropy, response_mask)
 
